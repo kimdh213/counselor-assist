@@ -50,6 +50,16 @@ export interface UpdateArticleRequest {
 export interface ChatRequest {
   conversation_id?: string; // omit to create new conversation
   message: string;
+  n_answers?: number; // 1~3, default 1
+}
+
+// ===== Recommended Answer =====
+
+export interface RecommendedAnswer {
+  rank: number;
+  content: string;
+  source_id: string; // article ID
+  source_title: string;
 }
 
 export interface SearchResult {

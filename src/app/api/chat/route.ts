@@ -7,7 +7,7 @@ import type { Message, Conversation } from '@/lib/types';
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
-  const { message, conversation_id } = body;
+  const { message, conversation_id, n_answers = 1 } = body;
 
   if (!message?.trim()) {
     return new Response(JSON.stringify({ error: 'Message is required' }), {
@@ -16,6 +16,7 @@ export async function POST(request: NextRequest) {
     });
   }
 
+  const nAnswers = Math.min(Math.max(1, Number(n_answers) || 1), 3);
   const db = getDb();
 
   // Get or create conversation
@@ -42,15 +43,14 @@ export async function POST(request: NextRequest) {
     'INSERT INTO messages (id, conversation_id, role, content) VALUES (?, ?, ?, ?)'
   ).run(userMsgId, convId, 'user', message.trim());
 
-  // Retrieve: FTS5 search
-  const sources = searchArticlesForRAG(message.trim(), 5);
+  // Retrieve: FTS5 search (get N documents for N answers)
+  const sources = searchArticlesForRAG(message.trim(), nAnswers > 1 ? nAnswers : 5);
 
   // Get conversation history
   const history = db.prepare(
     'SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC'
   ).all(convId) as Message[];
 
-  // Remove the just-inserted user message from history (we pass it separately)
   const pastHistory = history.filter(m => m.id !== userMsgId).map(m => ({
     ...m,
     sources: JSON.parse(m.sources as unknown as string),
@@ -59,18 +59,25 @@ export async function POST(request: NextRequest) {
   // Stream response via SSE
   const encoder = new TextEncoder();
   const sourceIds = sources.map(s => s.id);
+  const sourceMeta = sources.map(s => ({ id: s.id, title: s.title }));
 
   const stream = new ReadableStream({
     async start(controller) {
       try {
-        // Send conversation_id and sources first
+        // Send metadata first
         controller.enqueue(encoder.encode(
-          `data: ${JSON.stringify({ type: 'meta', conversation_id: convId, sources: sourceIds })}\n\n`
+          `data: ${JSON.stringify({
+            type: 'meta',
+            conversation_id: convId,
+            sources: sourceIds,
+            source_meta: sourceMeta,
+            n_answers: nAnswers,
+          })}\n\n`
         ));
 
         let fullResponse = '';
 
-        for await (const chunk of streamChatResponse(message.trim(), sources, pastHistory)) {
+        for await (const chunk of streamChatResponse(message.trim(), sources, pastHistory, nAnswers)) {
           fullResponse += chunk;
           controller.enqueue(encoder.encode(
             `data: ${JSON.stringify({ type: 'delta', content: chunk })}\n\n`

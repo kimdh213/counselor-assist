@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { useChat } from '@/hooks/useChat';
 import ChatContainer from '@/components/assist/ChatContainer';
@@ -9,11 +9,14 @@ import { Suspense } from 'react';
 function AssistContent() {
   const searchParams = useSearchParams();
   const conversationId = searchParams.get('conversation_id');
+  const [selectedNAnswers, setSelectedNAnswers] = useState(1);
 
   const {
     messages,
     isStreaming,
     error,
+    nAnswers,
+    sourceMeta,
     sendMessage,
     stopStreaming,
     newConversation,
@@ -26,15 +29,23 @@ function AssistContent() {
     }
   }, [conversationId, loadConversation]);
 
+  const handleSend = useCallback((content: string) => {
+    sendMessage(content, selectedNAnswers);
+  }, [sendMessage, selectedNAnswers]);
+
   return (
     <div className="h-screen flex flex-col">
       <ChatContainer
         messages={messages}
         isStreaming={isStreaming}
         error={error}
-        onSend={sendMessage}
+        nAnswers={nAnswers}
+        sourceMeta={sourceMeta}
+        onSend={handleSend}
         onStop={stopStreaming}
         onNewConversation={newConversation}
+        onNAnswersChange={setSelectedNAnswers}
+        selectedNAnswers={selectedNAnswers}
       />
     </div>
   );

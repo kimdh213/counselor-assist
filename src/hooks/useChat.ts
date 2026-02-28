@@ -3,12 +3,19 @@
 import { useState, useCallback, useRef } from 'react';
 import type { Message } from '@/lib/types';
 
+interface SourceMeta {
+  id: string;
+  title: string;
+}
+
 interface ChatState {
   messages: Message[];
   conversationId: string | null;
   isStreaming: boolean;
   error: string | null;
   sources: string[];
+  sourceMeta: SourceMeta[];
+  nAnswers: number;
 }
 
 export function useChat(initialConversationId?: string) {
@@ -18,6 +25,8 @@ export function useChat(initialConversationId?: string) {
     isStreaming: false,
     error: null,
     sources: [],
+    sourceMeta: [],
+    nAnswers: 1,
   });
   const abortRef = useRef<AbortController | null>(null);
 
@@ -32,10 +41,9 @@ export function useChat(initialConversationId?: string) {
     }));
   }, []);
 
-  const sendMessage = useCallback(async (content: string) => {
+  const sendMessage = useCallback(async (content: string, nAnswers: number = 1) => {
     if (!content.trim()) return;
 
-    // Add user message optimistically
     const userMessage: Message = {
       id: `temp-${Date.now()}`,
       conversation_id: state.conversationId || '',
@@ -45,15 +53,6 @@ export function useChat(initialConversationId?: string) {
       created_at: new Date().toISOString(),
     };
 
-    setState(prev => ({
-      ...prev,
-      messages: [...prev.messages, userMessage],
-      isStreaming: true,
-      error: null,
-      sources: [],
-    }));
-
-    // Create assistant message placeholder
     const assistantMessage: Message = {
       id: `temp-assistant-${Date.now()}`,
       conversation_id: state.conversationId || '',
@@ -65,7 +64,12 @@ export function useChat(initialConversationId?: string) {
 
     setState(prev => ({
       ...prev,
-      messages: [...prev.messages, assistantMessage],
+      messages: [...prev.messages, userMessage, assistantMessage],
+      isStreaming: true,
+      error: null,
+      sources: [],
+      sourceMeta: [],
+      nAnswers,
     }));
 
     try {
@@ -77,6 +81,7 @@ export function useChat(initialConversationId?: string) {
         body: JSON.stringify({
           message: content.trim(),
           conversation_id: state.conversationId,
+          n_answers: nAnswers,
         }),
         signal: abortRef.current.signal,
       });
@@ -109,6 +114,8 @@ export function useChat(initialConversationId?: string) {
               ...prev,
               conversationId: data.conversation_id,
               sources: data.sources || [],
+              sourceMeta: data.source_meta || [],
+              nAnswers: data.n_answers || 1,
             }));
           } else if (data.type === 'delta') {
             setState(prev => {
@@ -149,7 +156,6 @@ export function useChat(initialConversationId?: string) {
         ...prev,
         isStreaming: false,
         error: (err as Error).message,
-        // Remove the empty assistant message
         messages: prev.messages.filter(m => m.content || m.role !== 'assistant'),
       }));
     }
@@ -167,6 +173,8 @@ export function useChat(initialConversationId?: string) {
       isStreaming: false,
       error: null,
       sources: [],
+      sourceMeta: [],
+      nAnswers: 1,
     });
   }, []);
 
@@ -175,6 +183,8 @@ export function useChat(initialConversationId?: string) {
     conversationId: state.conversationId,
     isStreaming: state.isStreaming,
     error: state.error,
+    nAnswers: state.nAnswers,
+    sourceMeta: state.sourceMeta,
     sendMessage,
     stopStreaming,
     newConversation,
