@@ -19,27 +19,37 @@
 
 ## 2. 현행 시스템 분석
 
-### 2.1 현재 아키텍처
+### 2.1 시스템 구성
+
+| 시스템 | 기술 스택 | 역할 |
+|--------|----------|------|
+| **상담AP** | Java / Spring Boot | 상담사 화면, 어시스트 API 호출 클라이언트 |
+| **어시스트** | Python (API 서버) | RAG 처리, LLM 호출, 화면 없이 REST API만 제공 |
+| **Milvus** | 벡터DB | 문서 임베딩 벡터 검색 |
+| **PostgreSQL** | RDBMS | KMS 문서 저장 |
+
+### 2.2 현재 아키텍처
 
 ```
-[상담사 질문 입력]
+[상담AP - Java/Spring Boot]                [어시스트 - Python API]
+  상담사 화면                                 화면 없음, API만 제공
+      │                                          │
+      ├── 질문 HTTP 요청 ──────────────────────→ │
+      │                                          ├── 임베딩 API 호출 ─── 100~500ms
+      │                                          ├── Milvus 벡터 검색 ── 10~50ms
+      │                                          │
+      │                                          ├── 문서 1 → OpenAI 호출 ── 3~5초
+      │                                          ├── 문서 2 → OpenAI 호출 ── 3~5초
+      │                                          ├── 문서 3 → OpenAI 호출 ── 3~5초
+      │                                          │           (병렬, LangGraph)
+      │                                          │
+      │   ◀──── 답변 완성 순서대로 SSE 반환 ─────┤
+      │         (답변 단위, 토큰 단위 아님)
       │
-      ▼
-[임베딩 API 호출] ─────────────── 100~500ms
-      │
-      ▼
-[Milvus 벡터 검색] ────────────── 10~50ms
-      │
-      ├── 문서 1 ──→ [OpenAI 호출] ── 3~5초 ──→ 답변 1 표시
-      ├── 문서 2 ──→ [OpenAI 호출] ── 3~5초 ──→ 답변 2 표시
-      └── 문서 3 ──→ [OpenAI 호출] ── 3~5초 ──→ 답변 3 표시
-                                                (순위 순서대로)
-      │
-      ▼
-[LangGraph 오버헤드] ──────────── 수십~수백ms
+      └── 응답을 상담사 화면에 표시
 ```
 
-### 2.2 현재 방식의 문제점
+### 2.3 현재 방식의 문제점
 
 | 문제 | 상세 | 영향 |
 |------|------|------|
@@ -48,7 +58,7 @@
 | 임베딩 매번 생성 | 질문마다 임베딩 API 호출 | 100~500ms 고정 지연 |
 | LangGraph 오버헤드 | 단순 파이프라인에 복잡한 프레임워크 | 불필요한 초기화/실행 비용 |
 
-### 2.3 지연 시간 분해 (3개 답변 기준)
+### 2.4 지연 시간 분해 (3개 답변 기준)
 
 ```
 총 응답 시간 ≈ 임베딩(300ms) + 검색(30ms) + LLM(4초) + LangGraph(100ms) + 네트워크(100ms)
@@ -148,6 +158,156 @@
 **핵심**: 전체 응답 완료 시간은 비슷하지만, 첫 글자가 0.3초만에 나타나므로
 상담사가 답변을 읽기 시작할 수 있는 시점이 획기적으로 앞당겨짐.
 
+#### 양쪽 시스템 수정 가이드
+
+SSE 토큰 스트리밍은 **어시스트(Python)와 상담AP(Spring Boot) 양쪽 모두 수정**이 필요합니다.
+
+##### 어시스트 (Python) - SSE 스트리밍 응답
+
+```python
+# FastAPI 예시
+from fastapi import Request
+from fastapi.responses import StreamingResponse
+from openai import OpenAI  # 또는 anthropic
+
+client = OpenAI()
+
+async def generate_stream(question: str, docs: list, n_answers: int):
+    """LLM 스트리밍 호출 → SSE 형식으로 yield"""
+
+    prompt = build_prompt(question, docs, n_answers)
+
+    # 1. 메타데이터 전송
+    yield f"data: {json.dumps({'type': 'meta', 'sources': [d['id'] for d in docs]})}\n\n"
+
+    # 2. LLM 스트리밍 호출
+    stream = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        stream=True,
+    )
+
+    full_response = ""
+    for chunk in stream:
+        if chunk.choices[0].delta.content:
+            token = chunk.choices[0].delta.content
+            full_response += token
+            # 토큰 단위로 즉시 전송
+            yield f"data: {json.dumps({'type': 'delta', 'content': token})}\n\n"
+
+    # 3. 완료 신호
+    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    # 4. DB 저장 (비동기)
+    save_response_to_db(full_response)
+
+
+@app.post("/api/chat")
+async def chat(request: Request):
+    body = await request.json()
+    question = body["message"]
+    n_answers = body.get("n_answers", 1)
+
+    docs = search_milvus(question, limit=n_answers)
+
+    return StreamingResponse(
+        generate_stream(question, docs, n_answers),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+```
+
+##### 상담AP (Java/Spring Boot) - SSE 수신 및 화면 전달
+
+```java
+// 방법 1: 어시스트 SSE를 받아서 상담AP도 SSE로 프론트에 전달 (추천)
+@GetMapping(value = "/api/assist/chat", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+public Flux<String> chat(@RequestParam String question,
+                         @RequestParam(defaultValue = "1") int nAnswers) {
+
+    WebClient webClient = WebClient.create("http://assist-server:8000");
+
+    return webClient.post()
+        .uri("/api/chat")
+        .bodyValue(Map.of(
+            "message", question,
+            "n_answers", nAnswers
+        ))
+        .retrieve()
+        .bodyToFlux(String.class);  // SSE 이벤트를 그대로 프론트로 전달
+}
+```
+
+```javascript
+// 상담AP 프론트엔드 (JavaScript) - SSE 수신
+const eventSource = new EventSource('/api/assist/chat?question=' + encodeURIComponent(question));
+
+// 또는 fetch + ReadableStream (POST 요청 시)
+const res = await fetch('/api/assist/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: question, n_answers: 3 }),
+});
+
+const reader = res.body.getReader();
+const decoder = new TextDecoder();
+
+while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const lines = decoder.decode(value).split('\n\n');
+    for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = JSON.parse(line.slice(6));
+
+        if (data.type === 'delta') {
+            // 실시간으로 화면에 텍스트 추가
+            appendToAnswerCard(data.content);
+        } else if (data.type === 'done') {
+            // 스트리밍 완료
+            finishLoading();
+        }
+    }
+}
+```
+
+##### SSE 도입 시 데이터 흐름 (개선 후)
+
+```
+[상담AP - Java/Spring Boot]           [어시스트 - Python API]
+  상담사 화면                              │
+      │                                   │
+      ├── POST /api/chat ──────────────→  │
+      │   (question, n_answers)           ├── 검색
+      │                                   ├── LLM 1회 호출 (스트리밍)
+      │                                   │
+      │   ◀─── SSE: {type: "meta"}  ─────┤  0ms    메타데이터
+      │   ◀─── SSE: {type: "delta"} ─────┤  300ms  첫 토큰
+      │   ◀─── SSE: {type: "delta"} ─────┤  301ms  다음 토큰
+      │   ◀─── SSE: {type: "delta"} ─────┤  ...    계속
+      │   ◀─── SSE: {type: "done"}  ─────┤  3~5초  완료
+      │
+      ├── WebClient/Flux로 SSE 수신
+      ├── 프론트에 SSE 또는 WebSocket으로 전달
+      └── 상담사 화면에 실시간 타이핑 표시
+```
+
+##### 주의사항
+
+- **Spring Boot WebFlux** 또는 **Spring MVC + SseEmitter** 사용 필요
+  (기존 동기 방식 RestTemplate으로는 스트리밍 수신 불가)
+- 프록시(Nginx 등)에서 SSE 버퍼링을 비활성화해야 함
+  (`X-Accel-Buffering: no` 헤더 또는 `proxy_buffering off`)
+- 기존 API와 **병행 운영** 가능: 새 SSE 엔드포인트를 별도로 추가하고,
+  프론트에서 점진적으로 전환
+
 ### 3.3 임베딩 캐싱
 
 고객센터 질문은 패턴이 반복되는 특성상 캐시 히트율이 높음.
@@ -211,25 +371,27 @@ npm run dev
 
 | 작업 | 담당 | 기간 | 효과 |
 |------|------|------|------|
-| LLM 1회 호출 전환 | 백엔드 | 2~3일 | API 비용 1/3, 응답 시간 단축 |
-| 토큰 단위 SSE 스트리밍 | 백엔드 + 프론트 | 2~3일 | TTFT 10배 개선 |
-| 프롬프트 최적화 | 백엔드 | 1일 | 토큰 절약, 답변 품질 향상 |
+| LLM 1회 호출 전환 | 어시스트(Python) | 2~3일 | API 비용 1/3, 응답 시간 단축 |
+| 어시스트 SSE 스트리밍 응답 | 어시스트(Python) | 1~2일 | 토큰 단위 스트리밍 전송 |
+| 상담AP SSE 수신 연동 | 상담AP(Java/Spring Boot) | 2~3일 | WebFlux로 SSE 수신 + 프론트 전달 |
+| 상담AP 프론트 스트리밍 UI | 상담AP(프론트엔드) | 1~2일 | 실시간 타이핑 표시 |
+| 프롬프트 최적화 | 어시스트(Python) | 1일 | 토큰 절약, 답변 품질 향상 |
 
 ### Phase 2: 중기 개선 (2~4주)
 
 | 작업 | 담당 | 기간 | 효과 |
 |------|------|------|------|
-| 임베딩 캐싱 (Redis) | 백엔드 | 3~4일 | 검색 지연 300ms → 1ms |
-| LangGraph 경량화 | 백엔드 | 3~5일 | 오버헤드 제거 |
-| 하이브리드 검색 | 백엔드 | 1주 | 검색 품질 향상 |
+| 임베딩 캐싱 (Redis) | 어시스트(Python) | 3~4일 | 검색 지연 300ms → 1ms |
+| LangGraph 경량화 | 어시스트(Python) | 3~5일 | 오버헤드 제거 |
+| 하이브리드 검색 | 어시스트(Python) | 1주 | 검색 품질 향상 |
 
 ### Phase 3: 장기 검토 (1~2개월)
 
 | 작업 | 담당 | 기간 | 효과 |
 |------|------|------|------|
-| pgvector 도입 | 인프라 + 백엔드 | 2~3주 | Milvus 제거, 인프라 단순화 |
-| Semantic Caching | 백엔드 | 1~2주 | 반복 질문 즉시 응답 |
-| 동적 모델 선택 | 백엔드 | 1주 | 간단한 질문은 경량 모델 사용 |
+| pgvector 도입 | 인프라 + 어시스트(Python) | 2~3주 | Milvus 제거, 인프라 단순화 |
+| Semantic Caching | 어시스트(Python) | 1~2주 | 반복 질문 즉시 응답 |
+| 동적 모델 선택 | 어시스트(Python) | 1주 | 간단한 질문은 경량 모델 사용 |
 
 ---
 
@@ -258,6 +420,8 @@ npm run dev
 | 리스크 | 가능성 | 대응 방안 |
 |--------|--------|----------|
 | 1회 호출 시 답변 품질 저하 | 중 | 프롬프트 반복 튜닝, A/B 테스트로 비교 |
-| 스트리밍 전환 시 기존 연동 변경 | 높 | 상담AP 프론트엔드 수정 필요, 기존 API 병행 운영 |
+| 스트리밍 전환 시 양쪽 시스템 수정 필요 | 높 | 어시스트(Python) + 상담AP(Spring Boot) 동시 수정 필요. 기존 API 병행 운영으로 점진적 전환 |
+| Spring Boot 동기→비동기 전환 | 중 | WebFlux 또는 SseEmitter로 SSE 수신 처리. 기존 동기 코드와 공존 가능 |
+| Nginx 등 프록시 SSE 버퍼링 | 중 | `X-Accel-Buffering: no` 헤더 또는 `proxy_buffering off` 설정 |
 | 캐시 무효화 이슈 | 낮 | TTL 기반 자동 만료, 문서 변경 시 관련 캐시 삭제 |
 | LangGraph 제거 시 확장성 우려 | 중 | 현재 워크플로우 분석 후 판단, 필요시 유지 |
