@@ -1,10 +1,5 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
-
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -12,15 +7,59 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+:root {
+  --background: #f8fafc;
+  --foreground: #1e293b;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+
+/* Markdown styling in chat */
+.chat-content h1,
+.chat-content h2,
+.chat-content h3 {
+  font-weight: 700;
+  margin-top: 0.75em;
+  margin-bottom: 0.25em;
+}
+.chat-content h1 { font-size: 1.25rem; }
+.chat-content h2 { font-size: 1.125rem; }
+.chat-content h3 { font-size: 1rem; }
+.chat-content p { margin-bottom: 0.5em; }
+.chat-content ul, .chat-content ol {
+  padding-left: 1.5em;
+  margin-bottom: 0.5em;
+}
+.chat-content ul { list-style-type: disc; }
+.chat-content ol { list-style-type: decimal; }
+.chat-content li { margin-bottom: 0.25em; }
+.chat-content code {
+  background: #e2e8f0;
+  padding: 0.125em 0.375em;
+  border-radius: 0.25rem;
+  font-size: 0.875em;
+}
+.chat-content strong { font-weight: 700; }
+
+/* Safe area for mobile */
+@supports (padding-bottom: env(safe-area-inset-bottom)) {
+  .pb-safe {
+    padding-bottom: calc(env(safe-area-inset-bottom) + 1rem);
+  }
 }
